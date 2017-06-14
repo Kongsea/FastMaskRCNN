@@ -63,6 +63,20 @@ def solve(global_step):
 
 def restore(sess):
      """choose which param to restore"""
+     if FLAGS.restore_previous_if_exists:
+        try:
+            checkpoint_path = tf.train.latest_checkpoint(FLAGS.train_dir)
+            restorer = tf.train.Saver()
+            restorer.restore(sess, checkpoint_path)
+            print ('restored previous model %s from %s'\
+                    %(checkpoint_path, FLAGS.train_dir))
+            time.sleep(2)
+            return
+        except:
+            print ('--restore_previous_if_exists is set, but failed to restore in %s %s'\
+                    % (FLAGS.train_dir, checkpoint_path))
+            time.sleep(2)
+
      if FLAGS.pretrained_model:
         if tf.gfile.IsDirectory(FLAGS.pretrained_model):
             checkpoint_path = tf.train.latest_checkpoint(FLAGS.pretrained_model)
@@ -99,6 +113,18 @@ def train():
                              FLAGS.im_batch,
                              is_training=True)
     
+    data_queue = tf.RandomShuffleQueue(capacity=32, min_after_dequeue=16,
+            dtypes=(
+                image.dtype, ih.dtype, iw.dtype, 
+                gt_boxes.dtype, gt_masks.dtype, 
+                num_instances.dtype, img_id.dtype)) 
+    enqueue_op = data_queue.enqueue((image, ih, iw, gt_boxes, gt_masks, num_instances, img_id))
+    data_queue_runner = tf.train.QueueRunner(data_queue, [enqueue_op] * 4)
+    tf.add_to_collection(tf.GraphKeys.QUEUE_RUNNERS, data_queue_runner)
+    (image, ih, iw, gt_boxes, gt_masks, num_instances, img_id) =  data_queue.dequeue()
+    im_shape = tf.shape(image)
+    image = tf.reshape(image, (im_shape[0], im_shape[1], im_shape[2], 3))
+
     ## network
     logits, end_points, pyramid_map = network.get_network(FLAGS.network, image,
             weight_decay=FLAGS.weight_decay)
@@ -107,7 +133,7 @@ def train():
             base_anchors=9,
             is_training=True,
             gt_boxes=gt_boxes, gt_masks=gt_masks,
-            loss_weights=[0.1, 0.2, 1.0, 0.1, 0.5])
+            loss_weights=[0.2, 0.2, 1.0, 0.2, 1.0])
 
 
     total_loss = outputs['total_loss'] 
@@ -119,6 +145,9 @@ def train():
     global_step = slim.create_global_step()
     update_op = solve(global_step)
 
+    cropped_rois = tf.get_collection('__CROPPED__')[0]
+    transposed = tf.get_collection('__TRANSPOSED__')[0]
+    
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.8)
     sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
     init_op = tf.group(
@@ -138,6 +167,12 @@ def train():
 
     ## main loop
     coord = tf.train.Coordinator()
+    threads = []
+    # print (tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS))
+    for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
+        threads.extend(qr.create_threads(sess, coord=coord, daemon=True,
+                                         start=True))
+
     tf.train.start_queue_runners(sess=sess, coord=coord)
     saver = tf.train.Saver(max_to_keep=20)
 
@@ -152,8 +187,8 @@ def train():
                      sess.run([update_op, total_loss, regular_loss, img_id] + 
                               losses + 
                               [gt_boxes] + 
-                              batch_info)
-        
+                              batch_info )
+
         duration_time = time.time() - start_time
         if step % 1 == 0: 
             print ( """iter %d: image-id:%07d, time:%.3f(sec), regular_loss: %.6f, """
@@ -173,9 +208,9 @@ def train():
             summary_str = sess.run(summary_op)
             summary_writer.add_summary(summary_str, step)
 
-        if (step % 1000 == 0 or step + 1 == FLAGS.max_iters) and step != 0:
+        if (step % 10000 == 0 or step + 1 == FLAGS.max_iters) and step != 0:
             checkpoint_path = os.path.join(FLAGS.train_dir, 
-                                           FLAGS.dataset_name + '_model.ckpt')
+                                           FLAGS.dataset_name + '_' + FLAGS.network + '_model.ckpt')
             saver.save(sess, checkpoint_path, global_step=step)
 
         if coord.should_stop():
